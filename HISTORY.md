@@ -6,6 +6,20 @@ dev
 
 - \[Short description of non-trivial change.\]
 
+**Features**
+- Request bodies that can only be read sequentially (generators, iterators,
+  and other streams without a usable `tell()`/`seek()`) are now replayed in
+  full when a 307 or 308 redirect requires resending them. As such a body is
+  read for sending, its bytes are spooled: up to 1 MiB
+  (`requests.models.STREAMING_BODY_SPOOL_MAX_SIZE`) is buffered in memory and
+  anything beyond that rolls over to a temporary file, so bodies are never
+  held in memory wholesale. Each request rebuilt for a redirect reads the
+  spooled body through its own independent position. Spooled temporary files
+  are released deterministically when the redirect chain finishes, when it
+  fails partway, and when the owning session is closed. Seekable bodies keep
+  their existing rewind behaviour, and sequential bodies are still sent with
+  `Transfer-Encoding: chunked` and no `Content-Length`.
+
 
 2.34.2 (2026-05-14)
 -------------------

@@ -378,6 +378,12 @@ a length) for your body::
 
     requests.post('http://some.url/chunked', data=gen())
 
+If the server responds with a 307 or 308 redirect, the body is sent again in
+full. To make that possible for bodies that can only be read once, Requests
+spools the body as it is read: up to 1 MiB is buffered in memory and anything
+beyond that is written to a temporary file, which is removed once the
+redirect chain (or the session) is closed.
+
 For chunked encoded responses, it's best to iterate over the data using
 :meth:`Response.iter_content() <requests.Response.iter_content>`. In
 an ideal situation you'll have set ``stream=True`` on the request, in which

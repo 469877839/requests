@@ -13,6 +13,9 @@ import datetime
 # Implicit import within threads may cause LookupError when standard library is in a ZIP,
 # such as in Embedded Python. See https://github.com/psf/requests/issues/3578.
 import encodings.idna  # noqa: F401
+import os
+import tempfile
+import threading
 from collections.abc import Callable, Generator, Iterable, Iterator, Mapping
 from io import UnsupportedOperation
 from typing import (
@@ -103,6 +106,149 @@ REDIRECT_STATI: Final[tuple[int, ...]] = (  # type: ignore[assignment]
 DEFAULT_REDIRECT_LIMIT: int = 30
 CONTENT_CHUNK_SIZE: int = 10 * 1024
 ITER_CHUNK_SIZE: int = 512
+
+#: Maximum number of bytes of a streaming request body that is kept in
+#: memory while it is spooled for redirect replays. Bodies larger than
+#: this roll over to a temporary file on disk.
+STREAMING_BODY_SPOOL_MAX_SIZE: int = 1024 * 1024
+
+
+class _BodySpool:
+    """Shared spooled copy of a streaming request body.
+
+    Bytes are copied ("tee'd") into a :class:`tempfile.SpooledTemporaryFile`
+    as they are read from the original body, so that the body can be
+    replayed from the beginning when a 307/308 redirect requires resending
+    it. Bodies up to ``max_memory_size`` bytes stay in memory; larger ones
+    roll over to a temporary file on disk.
+    """
+
+    def __init__(self, body: Any, max_memory_size: int) -> None:
+        self._chunks: Iterator[bytes | str] | None = self._iter_chunks(body)
+        self._spool = tempfile.SpooledTemporaryFile(max_size=max_memory_size)
+        self._length = 0
+        self._exhausted = False
+        self._closed = False
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def _iter_chunks(body: Any) -> Iterator[bytes | str]:
+        read = getattr(body, "read", None)
+        if read is not None:
+            while True:
+                chunk = read(CONTENT_CHUNK_SIZE)
+                if not chunk:
+                    return
+                yield chunk
+        else:
+            yield from body
+
+    def _fill(self, end: float) -> None:
+        """Pull chunks from the source until ``end`` bytes are spooled.
+
+        Must be called with ``self._lock`` held.
+        """
+        while not self._exhausted and self._length < end:
+            try:
+                chunk = next(self._chunks)  # type: ignore[arg-type]  # None only when closed
+            except StopIteration:
+                self._exhausted = True
+            else:
+                if not chunk:
+                    continue
+                if isinstance(chunk, str):
+                    chunk = chunk.encode("utf-8")
+                self._spool.seek(0, os.SEEK_END)
+                self._spool.write(chunk)
+                self._length += len(chunk)
+
+    def read_at(self, position: int, size: int | None) -> bytes:
+        """Return up to ``size`` bytes of the body starting at ``position``,
+        spooling more of the source stream as needed. Returns ``b""`` once
+        the spool has been closed.
+        """
+        with self._lock:
+            if self._closed:
+                return b""
+            if size is None or size < 0:
+                self._fill(float("inf"))
+                end = self._length
+            else:
+                self._fill(position + size)
+                end = min(position + size, self._length)
+            if position >= end:
+                return b""
+            self._spool.seek(position)
+            return self._spool.read(end - position)
+
+    def ensure(self, position: int) -> int:
+        """Spool the source up to ``position`` and return the position that
+        is actually available, which may be shorter if the source stream
+        ended first.
+        """
+        with self._lock:
+            if self._closed:
+                return 0
+            self._fill(position)
+            return min(position, self._length)
+
+    def close(self) -> None:
+        """Release the spool and any temporary file behind it."""
+        with self._lock:
+            if not self._closed:
+                self._closed = True
+                self._chunks = None
+                self._spool.close()
+
+
+class _ReplayableBody:
+    """File-like view over a shared :class:`_BodySpool`.
+
+    Each view has its own read position, so a request rebuilt for a
+    redirect can re-read the body from the start without affecting the
+    positions of other views.
+    """
+
+    def __init__(self, spool: _BodySpool) -> None:
+        self._spool = spool
+        self._position = 0
+
+    @classmethod
+    def from_body(cls, body: Any) -> _ReplayableBody:
+        return cls(_BodySpool(body, STREAMING_BODY_SPOOL_MAX_SIZE))
+
+    def read(self, size: int | None = -1) -> bytes:
+        data = self._spool.read_at(self._position, size)
+        self._position += len(data)
+        return data
+
+    def tell(self) -> int:
+        return self._position
+
+    def seek(self, offset: int, whence: int = os.SEEK_SET) -> int:
+        if whence == os.SEEK_SET:
+            position = offset
+        elif whence == os.SEEK_CUR:
+            position = self._position + offset
+        else:
+            # The end of the body is unknown until the source stream is
+            # exhausted, so seeking relative to it is not supported.
+            raise OSError("Cannot seek relative to the end of a streaming body")
+        if position < 0:
+            raise ValueError(f"Negative seek position: {position}")
+        self._position = self._spool.ensure(position)
+        return self._position
+
+    def fork(self) -> _ReplayableBody:
+        """Return a new view over the same spool, with its own position."""
+        return _ReplayableBody(self._spool)
+
+    def __iter__(self) -> Iterator[bytes]:
+        while True:
+            chunk = self.read(CONTENT_CHUNK_SIZE)
+            if not chunk:
+                return
+            yield chunk
 
 
 class RequestEncodingMixin:
@@ -459,7 +605,12 @@ class PreparedRequest(RequestEncodingMixin, RequestHooksMixin):
         p.url = self.url
         p.headers = self.headers.copy() if self.headers is not None else None  # type: ignore[assignment]
         p._cookies = _copy_cookie_jar(self._cookies)
-        p.body = self.body
+        body = self.body
+        if isinstance(body, _ReplayableBody):
+            # Give the copy its own read position over the shared spool, so
+            # consuming one request's body doesn't affect the other's.
+            body = body.fork()
+        p.body = body  # type: ignore[assignment]  # _ReplayableBody quacks like BodyType
         p.hooks = self.hooks
         p._body_position = self._body_position
         return p
@@ -618,6 +769,13 @@ class PreparedRequest(RequestEncodingMixin, RequestHooksMixin):
                     # This differentiates from None, allowing us to catch
                     # a failed `tell()` later when trying to rewind the body
                     self._body_position = object()
+            else:
+                # Bodies that can't report a read position (generators and
+                # other sequential streams) can't be rewound in place. Spool
+                # them as they're read, so the full body can be replayed if
+                # a 307/308 redirect requires sending it again.
+                body = _ReplayableBody.from_body(body)
+                self._body_position = 0
 
             if files:
                 raise NotImplementedError(

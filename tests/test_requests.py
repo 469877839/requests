@@ -50,7 +50,7 @@ from requests.exceptions import (
 )
 from requests.exceptions import SSLError as RequestsSSLError
 from requests.hooks import default_hooks
-from requests.models import PreparedRequest, urlencode
+from requests.models import PreparedRequest, _BodySpool, _ReplayableBody, urlencode
 from requests.sessions import SessionRedirectMixin
 from requests.structures import CaseInsensitiveDict
 
@@ -2098,6 +2098,75 @@ class TestRequests:
             requests.utils.rewind_body(prep)
 
         assert "Unable to rewind request body" in str(e)
+
+    def test_prepare_body_wraps_non_seekable_stream(self):
+        data = iter([b"the ", b"data"])
+        prep = requests.Request("POST", "http://example.com", data=data).prepare()
+        assert isinstance(prep.body, _ReplayableBody)
+        assert prep._body_position == 0
+        # the body is still sent chunked, with no Content-Length
+        assert prep.headers["Transfer-Encoding"] == "chunked"
+        assert "Content-Length" not in prep.headers
+
+    def test_rewind_body_non_seekable_stream(self):
+        data = iter([b"the ", b"data"])
+        prep = requests.Request("POST", "http://example.com", data=data).prepare()
+        assert prep.body.read() == b"the data"
+
+        # the data has all been read
+        assert prep.body.read() == b""
+
+        # rewind it back: the spooled bytes can be replayed
+        requests.utils.rewind_body(prep)
+        assert prep.body.read() == b"the data"
+
+    def test_rewind_body_non_seekable_stream_str_chunks(self):
+        data = iter(["the ", "data"])
+        prep = requests.Request("POST", "http://example.com", data=data).prepare()
+        assert prep.body.read() == b"the data"
+
+        requests.utils.rewind_body(prep)
+        assert prep.body.read() == b"the data"
+
+    def test_rewind_body_non_seekable_stream_partially_sent(self):
+        data = iter([b"the ", b"data"])
+        prep = requests.Request("POST", "http://example.com", data=data).prepare()
+        # only part of the body is sent before the rewind, e.g. the first
+        # send failed halfway; the replay must still deliver the full body
+        assert prep.body.read(3) == b"the"
+
+        requests.utils.rewind_body(prep)
+        assert prep.body.read() == b"the data"
+
+    def test_spooled_body_super_len_is_unknown(self):
+        data = iter([b"the ", b"data"])
+        prep = requests.Request("POST", "http://example.com", data=data).prepare()
+        # super_len must not drain the stream nor report a length for it
+        assert requests.utils.super_len(prep.body) == 0
+        assert prep.body.read() == b"the data"
+
+    def test_copy_of_spooled_body_has_independent_position(self):
+        data = iter([b"the ", b"data"])
+        prep = requests.Request("POST", "http://example.com", data=data).prepare()
+        copied = prep.copy()
+
+        # reading the copy to the end doesn't move the original's position
+        assert copied.body.read() == b"the data"
+        assert prep.body.tell() == 0
+        assert prep.body.read() == b"the data"
+
+    def test_body_spool_rolls_over_to_disk(self):
+        spool = _BodySpool(iter([b"x" * 2048]), max_memory_size=1024)
+        view = _ReplayableBody(spool)
+        assert view.read() == b"x" * 2048
+        assert spool._spool._rolled
+        spool.close()
+
+    def test_body_spool_reads_empty_once_closed(self):
+        spool = _BodySpool(iter([b"the data"]), max_memory_size=1024)
+        view = _ReplayableBody(spool)
+        spool.close()
+        assert view.read() == b""
 
     def test_getattr_proxy_stream_follows_redirect(self, httpbin):
         """Ensure stream wrappers that don't implement __iter__ directly are still detected."""

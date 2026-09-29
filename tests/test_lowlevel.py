@@ -1,3 +1,4 @@
+import io
 import threading
 
 import pytest
@@ -426,3 +427,149 @@ def test_json_decode_compatibility_for_alt_utf_encodings():
     assert isinstance(excinfo.value, requests.exceptions.RequestException)
     assert isinstance(excinfo.value, JSONDecodeError)
     assert r.text not in str(excinfo.value)
+
+
+def make_redirect_server(status_code, requests_to_handle=2, respond_final=True):
+    """Server that redirects the first request to /redirected and (by
+    default) answers the redirected request with a 200."""
+
+    def redirect_handler(sock):
+        request_content = consume_socket_content(sock, timeout=0.5)
+        request_line = request_content.split(b"\r\n", 1)[0]
+        if request_line.endswith(b" /redirected HTTP/1.1"):
+            if respond_final:
+                sock.send(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+        else:
+            sock.send(
+                b"HTTP/1.1 %d Redirect\r\n"
+                b"Location: /redirected\r\n"
+                b"Content-Length: 0\r\n\r\n" % status_code
+            )
+        return request_content
+
+    close_server = threading.Event()
+    server = Server(
+        redirect_handler,
+        requests_to_handle=requests_to_handle,
+        wait_to_close_event=close_server,
+    )
+    return server, close_server
+
+
+def dechunk(request_content):
+    """Extract the body of a chunked request captured on the wire."""
+    body = request_content.split(b"\r\n\r\n", 1)[1]
+    decoded = b""
+    while True:
+        size_line, body = body.split(b"\r\n", 1)
+        size = int(size_line, 16)
+        if size == 0:
+            return decoded
+        decoded += body[:size]
+        body = body[size + 2:]
+
+
+@pytest.mark.parametrize("status_code", [307, 308])
+def test_redirect_resends_streaming_body(status_code):
+    """a 307/308 redirect replays the full body of a non-seekable stream"""
+    server, close_server = make_redirect_server(status_code)
+    data = iter([b"first ", b"second ", b"third"])
+
+    with server as (host, port):
+        url = f"http://{host}:{port}/"
+        r = requests.post(url, data=data, stream=True)
+        close_server.set()  # release server block
+
+    assert r.status_code == 200
+    assert r.history[0].status_code == status_code
+
+    first_request, second_request = server.handler_results
+    # both requests carry the complete body, sent chunked
+    assert dechunk(first_request) == b"first second third"
+    assert dechunk(second_request) == b"first second third"
+    second_headers = second_request.split(b"\r\n\r\n", 1)[0]
+    assert b"Transfer-Encoding: chunked" in second_headers
+    assert b"Content-Length" not in second_headers
+
+
+def test_redirect_resends_large_streaming_body_from_disk_spool():
+    """bodies larger than the in-memory threshold are spooled to a
+    temporary file and still replayed in full on a 307/308 redirect"""
+    server, close_server = make_redirect_server(307)
+    chunk = b"x" * 1024
+    # 1.5 MiB: beyond the 1 MiB in-memory spool threshold
+    data = iter([chunk] * 1536)
+
+    with server as (host, port):
+        url = f"http://{host}:{port}/"
+        r = requests.post(url, data=data, stream=True)
+        close_server.set()  # release server block
+
+    assert r.status_code == 200
+    first_request, second_request = server.handler_results
+    assert dechunk(first_request) == chunk * 1536
+    assert dechunk(second_request) == chunk * 1536
+
+
+def test_redirect_spooled_body_seekable_file_unchanged():
+    """seekable bodies keep their existing rewind behaviour on redirects"""
+    server, close_server = make_redirect_server(307)
+
+    with server as (host, port):
+        url = f"http://{host}:{port}/"
+        r = requests.post(url, data=io.BytesIO(b"seekable body"), stream=True)
+        close_server.set()  # release server block
+
+    assert r.status_code == 200
+    first_request, second_request = server.handler_results
+    assert first_request.endswith(b"seekable body")
+    assert second_request.endswith(b"seekable body")
+    second_headers = second_request.split(b"\r\n\r\n", 1)[0]
+    assert b"Content-Length: 13" in second_headers
+
+
+def test_redirect_spool_closed_after_chain():
+    """the body spool is released once the redirect chain is done"""
+    server, close_server = make_redirect_server(307)
+
+    session = requests.Session()
+    with server as (host, port):
+        url = f"http://{host}:{port}/"
+        prep = requests.Request("POST", url, data=iter([b"data"])).prepare()
+        spool = prep.body._spool
+        r = session.send(prep, stream=True)
+        close_server.set()  # release server block
+
+    assert r.status_code == 200
+    assert spool._closed
+    assert not session._open_spools
+
+
+def test_redirect_spool_closed_on_error():
+    """the body spool is released even when the redirect chain fails"""
+    server, close_server = make_redirect_server(307, respond_final=False)
+
+    session = requests.Session()
+    with server as (host, port):
+        url = f"http://{host}:{port}/"
+        prep = requests.Request("POST", url, data=iter([b"data"])).prepare()
+        spool = prep.body._spool
+        with pytest.raises(requests.exceptions.ConnectionError):
+            session.send(prep, stream=True)
+        close_server.set()  # release server block
+
+    assert spool._closed
+    assert not session._open_spools
+
+
+def test_spooled_body_closed_when_session_closed():
+    """session.close() releases body spools that are still open"""
+    from requests.models import _BodySpool
+
+    session = requests.Session()
+    spool = _BodySpool(iter([b"data"]), max_memory_size=1024)
+    session._open_spools.add(spool)
+
+    session.close()
+    assert spool._closed
+    assert not session._open_spools

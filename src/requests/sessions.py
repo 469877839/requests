@@ -42,6 +42,8 @@ from .models import (  # noqa: F401
     PreparedRequest,
     Request,
     Response,
+    _BodySpool,
+    _ReplayableBody,
 )
 from .status_codes import codes
 from .structures import CaseInsensitiveDict
@@ -297,6 +299,7 @@ class SessionRedirectMixin:
                     cert=cert,
                     proxies=proxies,
                     allow_redirects=False,
+                    _close_spool=False,
                     **adapter_kwargs,
                 )
 
@@ -496,6 +499,12 @@ class Session(SessionRedirectMixin):
         #: :class:`RequestsCookieJar <requests.cookies.RequestsCookieJar>`, but
         #: may be any other ``cookielib.CookieJar`` compatible object.
         self.cookies = cookiejar_from_dict({})
+
+        #: Spools of streaming request bodies with sends in flight. A spool
+        #: is closed as soon as the send that owns it (including any
+        #: redirect chain) finishes; any still open when the session is
+        #: closed are cleaned up then, so no temporary files are leaked.
+        self._open_spools: set[_BodySpool] = set()
 
         # Default connection adapters.
         self.adapters = OrderedDict()
@@ -774,59 +783,81 @@ class Session(SessionRedirectMixin):
         stream = kwargs.get("stream")
         hooks = request.hooks
 
+        # resolve_redirects sends the individual redirect hops through this
+        # method with _close_spool=False, leaving cleanup of the shared
+        # body spool to the send that started the chain.
+        close_spool = kwargs.pop("_close_spool", True)
+
         # Get the appropriate adapter to use
         adapter = self.get_adapter(url=request.url)
 
-        # Start time (approximately) of the request
-        start = preferred_clock()
+        # Streaming bodies that can't be rewound in place are spooled so
+        # that redirects can replay them. The spool (and the temporary file
+        # behind it, if any) is released once this send — including the
+        # whole redirect chain — is done, even if it fails partway.
+        spool = (
+            request.body._spool if isinstance(request.body, _ReplayableBody) else None
+        )
+        if spool is not None:
+            self._open_spools.add(spool)
 
-        # Send the request
-        r = adapter.send(request, **kwargs)
+        try:
+            # Start time (approximately) of the request
+            start = preferred_clock()
 
-        # Total elapsed time of the request (approximately)
-        elapsed = preferred_clock() - start
-        r.elapsed = timedelta(seconds=elapsed)
+            # Send the request
+            r = adapter.send(request, **kwargs)
 
-        # Response manipulation hooks
-        r = dispatch_hook("response", hooks, r, **kwargs)
+            # Total elapsed time of the request (approximately)
+            elapsed = preferred_clock() - start
+            r.elapsed = timedelta(seconds=elapsed)
 
-        # Persist cookies
-        if r.history:
-            # If the hooks create history then we want those cookies too
-            for resp in r.history:
-                extract_cookies_to_jar(self.cookies, resp.request, resp.raw)
+            # Response manipulation hooks
+            r = dispatch_hook("response", hooks, r, **kwargs)
 
-        extract_cookies_to_jar(self.cookies, request, r.raw)
+            # Persist cookies
+            if r.history:
+                # If the hooks create history then we want those cookies too
+                for resp in r.history:
+                    extract_cookies_to_jar(self.cookies, resp.request, resp.raw)
 
-        # Resolve redirects if allowed.
-        if allow_redirects:
-            # Redirect resolving generator.
-            gen = self.resolve_redirects(r, request, **kwargs)
-            history = [resp for resp in gen]
-        else:
-            history = []
+            extract_cookies_to_jar(self.cookies, request, r.raw)
 
-        # Shuffle things around if there's history.
-        if history:
-            # Insert the first (original) request at the start
-            history.insert(0, r)
-            # Get the last request made
-            r = history.pop()
-            r.history = history
+            # Resolve redirects if allowed.
+            if allow_redirects:
+                # Redirect resolving generator.
+                gen = self.resolve_redirects(r, request, **kwargs)
+                history = [resp for resp in gen]
+            else:
+                history = []
 
-        # If redirects aren't being followed, store the response on the Request for Response.next().
-        if not allow_redirects:
-            try:
-                r._next = next(  # type: ignore[assignment]  # yield_requests=True returns PreparedRequest
-                    self.resolve_redirects(r, request, yield_requests=True, **kwargs)
-                )
-            except StopIteration:
-                pass
+            # Shuffle things around if there's history.
+            if history:
+                # Insert the first (original) request at the start
+                history.insert(0, r)
+                # Get the last request made
+                r = history.pop()
+                r.history = history
 
-        if not stream:
-            r.content
+            # If redirects aren't being followed, store the response on the Request for Response.next().
+            if not allow_redirects:
+                try:
+                    r._next = next(  # type: ignore[assignment]  # yield_requests=True returns PreparedRequest
+                        self.resolve_redirects(
+                            r, request, yield_requests=True, **kwargs
+                        )
+                    )
+                except StopIteration:
+                    pass
 
-        return r
+            if not stream:
+                r.content
+
+            return r
+        finally:
+            if spool is not None and close_spool:
+                spool.close()
+                self._open_spools.discard(spool)
 
     def merge_environment_settings(
         self,
@@ -882,6 +913,12 @@ class Session(SessionRedirectMixin):
 
     def close(self) -> None:
         """Closes all adapters and as such the session"""
+        # Release any body spools whose sends never finished (e.g. a
+        # redirect generator that was abandoned mid-chain), so their
+        # temporary files don't leak with the connection pools.
+        for spool in tuple(self._open_spools):
+            spool.close()
+        self._open_spools.clear()
         for v in self.adapters.values():
             v.close()
 
@@ -901,6 +938,7 @@ class Session(SessionRedirectMixin):
         return state
 
     def __setstate__(self, state: dict[str, Any]) -> None:
+        self._open_spools = set()
         for attr, value in state.items():
             setattr(self, attr, value)
 
