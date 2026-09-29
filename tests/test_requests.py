@@ -9,7 +9,9 @@ import pickle
 import re
 import tempfile
 import threading
+import time
 import warnings
+from email.utils import formatdate
 from unittest import mock
 
 import pytest
@@ -51,7 +53,7 @@ from requests.exceptions import (
 from requests.exceptions import SSLError as RequestsSSLError
 from requests.hooks import default_hooks
 from requests.models import PreparedRequest, urlencode
-from requests.sessions import SessionRedirectMixin
+from requests.sessions import SessionRedirectMixin, _parse_retry_after
 from requests.structures import CaseInsensitiveDict
 
 from . import SNIMissingWarning
@@ -2600,6 +2602,251 @@ class TestTimeout:
         """See: https://github.com/psf/requests/issues/2316"""
         r = requests.request(b"GET", httpbin("get"))
         assert r.ok
+
+
+class ScriptedAdapter:
+    """Adapter test double replaying a scripted sequence of outcomes.
+
+    Each outcome is either an exception to raise, or a
+    ``(status_code, headers)`` tuple to respond with.
+    """
+
+    def __init__(self, outcomes):
+        self.outcomes = list(outcomes)
+        self.requests = []
+        self.bodies = []
+
+    def send(self, request, **kwargs):
+        self.requests.append(request)
+        body = request.body
+        if hasattr(body, "read"):
+            body = body.read()
+        self.bodies.append(body)
+        outcome = self.outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        status_code, headers = outcome
+        response = requests.Response()
+        response.status_code = status_code
+        response.url = request.url
+        response.headers = CaseInsensitiveDict(headers or {})
+        response.request = request
+        response.raw = io.BytesIO(b"")
+        return response
+
+    def close(self):
+        pass
+
+
+def make_retry_session(outcomes, **settings):
+    """Build a session wired to a ScriptedAdapter with retries configured."""
+    session = requests.Session()
+    session.trust_env = False
+    adapter = ScriptedAdapter(outcomes)
+    session.mount("http://", adapter)
+    # Keep the tests fast; backoff behavior is exercised separately.
+    session.retry_backoff_factor = 0
+    for key, value in settings.items():
+        setattr(session, key, value)
+    return session, adapter
+
+
+class TestSessionRetries:
+    def test_retries_disabled_by_default(self):
+        session, adapter = make_retry_session([ConnectionError("boom")])
+        with pytest.raises(ConnectionError):
+            session.get("http://example.com/")
+        assert len(adapter.requests) == 1
+        assert session.total_retries == 0
+
+    def test_retry_on_connection_error(self):
+        outcomes = [ConnectionError("boom"), ConnectionError("boom"), (200, None)]
+        session, adapter = make_retry_session(outcomes, max_retries=2)
+        r = session.get("http://example.com/")
+        assert r.status_code == 200
+        assert len(adapter.requests) == 3
+        assert session.total_retries == 2
+
+    def test_retry_on_timeout(self):
+        session, adapter = make_retry_session(
+            [Timeout("boom"), (200, None)], max_retries=1
+        )
+        r = session.get("http://example.com/")
+        assert r.status_code == 200
+        assert session.total_retries == 1
+
+    def test_retry_exhausted_reraises_original_exception(self):
+        outcomes = [ConnectionError("first")] * 3
+        session, adapter = make_retry_session(outcomes, max_retries=1)
+        with pytest.raises(ConnectionError, match="first"):
+            session.get("http://example.com/")
+        assert len(adapter.requests) == 2
+        assert session.total_retries == 1
+
+    def test_retry_on_retryable_status(self):
+        outcomes = [(503, {"Retry-After": "0"}), (200, None)]
+        session, adapter = make_retry_session(outcomes, max_retries=1)
+        r = session.get("http://example.com/")
+        assert r.status_code == 200
+        assert len(adapter.requests) == 2
+        assert session.total_retries == 1
+
+    @pytest.mark.parametrize("status_code", [429, 500, 502, 503, 504])
+    def test_default_retry_status_codes(self, status_code):
+        outcomes = [(status_code, None), (200, None)]
+        session, adapter = make_retry_session(outcomes, max_retries=1)
+        r = session.get("http://example.com/")
+        assert r.status_code == 200
+        assert len(adapter.requests) == 2
+
+    def test_non_retryable_status_not_retried(self):
+        session, adapter = make_retry_session([(400, None)], max_retries=2)
+        r = session.get("http://example.com/")
+        assert r.status_code == 400
+        assert len(adapter.requests) == 1
+        assert session.total_retries == 0
+
+    def test_retry_rewinds_file_body(self):
+        outcomes = [ConnectionError("boom"), (200, None)]
+        session, adapter = make_retry_session(outcomes, max_retries=1)
+        r = session.post("http://example.com/", data=io.BytesIO(b"hello"))
+        assert r.status_code == 200
+        # The body was consumed by the first attempt and rewound for the retry.
+        assert adapter.bodies == [b"hello", b"hello"]
+
+    def test_retry_reusable_bytes_body(self):
+        outcomes = [ConnectionError("boom"), (200, None)]
+        session, adapter = make_retry_session(outcomes, max_retries=1)
+        r = session.post("http://example.com/", data=b"hello")
+        assert r.status_code == 200
+        assert adapter.bodies == [b"hello", b"hello"]
+
+    def test_retry_abandoned_for_unpositioned_stream(self):
+        outcomes = [ConnectionError("first"), ConnectionError("second")]
+        session, adapter = make_retry_session(outcomes, max_retries=3)
+        data = (chunk for chunk in (b"a", b"b"))
+        with pytest.raises(ConnectionError, match="first"):
+            session.post("http://example.com/", data=data)
+        # A generator body cannot be rewound, so no retry was attempted and
+        # the original exception propagated unchanged.
+        assert len(adapter.requests) == 1
+        assert session.total_retries == 0
+
+    def test_retry_with_streaming_response(self):
+        outcomes = [(503, None), (200, None)]
+        session, adapter = make_retry_session(outcomes, max_retries=1)
+        r = session.get("http://example.com/", stream=True)
+        assert r.status_code == 200
+        assert len(adapter.requests) == 2
+
+    def test_response_hooks_fire_once_per_final_response(self):
+        outcomes = [ConnectionError("boom"), (503, None), (200, None)]
+        session, adapter = make_retry_session(outcomes, max_retries=2)
+        calls = []
+
+        def hook(response, **kwargs):
+            calls.append(response.status_code)
+
+        r = session.get("http://example.com/", hooks={"response": hook})
+        assert r.status_code == 200
+        assert calls == [200]
+
+    def test_retry_on_redirect_hop_preserves_history(self):
+        outcomes = [(301, {"Location": "/other"}), ConnectionError("boom"), (200, None)]
+        session, adapter = make_retry_session(outcomes, max_retries=1)
+        r = session.get("http://example.com/")
+        assert r.status_code == 200
+        assert r.url == "http://example.com/other"
+        # History contains exactly the redirect hop; retries leave no trace.
+        assert len(r.history) == 1
+        assert r.history[0].status_code == 301
+        assert len(adapter.requests) == 3
+        assert session.total_retries == 1
+
+    def test_retry_after_header_is_honored(self):
+        outcomes = [(503, {"Retry-After": "120"}), (200, None)]
+        session, adapter = make_retry_session(outcomes, max_retries=1)
+        with mock.patch("requests.sessions.time.sleep") as sleep:
+            r = session.get("http://example.com/")
+        assert r.status_code == 200
+        sleep.assert_called_once_with(120.0)
+
+    def test_exponential_backoff_without_retry_after(self):
+        outcomes = [ConnectionError("boom")] * 3 + [(200, None)]
+        session, adapter = make_retry_session(
+            outcomes, max_retries=3, retry_backoff_factor=0.5
+        )
+        with mock.patch("requests.sessions.time.sleep") as sleep:
+            r = session.get("http://example.com/")
+        assert r.status_code == 200
+        assert [call.args[0] for call in sleep.call_args_list] == [0.5, 1.0, 2.0]
+
+    def test_rewind_body_retry_message(self):
+        class BadFileObj:
+            def tell(self):
+                return 0
+
+            def __iter__(self):
+                return
+
+        prep = requests.Request(
+            "POST", "http://example.com", data=BadFileObj()
+        ).prepare()
+        with pytest.raises(UnrewindableBodyError) as e:
+            requests.utils.rewind_body(prep, purpose="retry")
+        assert str(e.value) == "Unable to rewind request body for retry."
+
+    @pytest.mark.parametrize(
+        "value, expected",
+        (
+            (None, None),
+            ("", None),
+            ("3", 3.0),
+            ("0", 0.0),
+            ("not-a-date", None),
+        ),
+    )
+    def test_parse_retry_after(self, value, expected):
+        assert _parse_retry_after(value) == expected
+
+    def test_parse_retry_after_http_date(self):
+        value = formatdate(time.time() + 120, usegmt=True)
+        delay = _parse_retry_after(value)
+        assert 100 < delay <= 120
+
+    def test_session_pickle_roundtrip_keeps_retry_settings(self):
+        session, _ = make_retry_session([], max_retries=2)
+        session.total_retries = 5
+        restored = pickle.loads(pickle.dumps(session))
+        assert restored.max_retries == 2
+        assert restored.retry_backoff_factor == 0
+        assert restored.retry_status_codes == frozenset({429, 500, 502, 503, 504})
+        assert restored.total_retries == 5
+
+        # The unpicklable retry lock is recreated, and retries still work.
+        adapter = ScriptedAdapter([ConnectionError("boom"), (200, None)])
+        restored.mount("http://", adapter)
+        restored.trust_env = False
+        r = restored.get("http://example.com/")
+        assert r.status_code == 200
+        assert restored.total_retries == 6
+
+    def test_session_unpickle_legacy_state_defaults(self):
+        session = requests.Session()
+        state = session.__getstate__()
+        for key in (
+            "max_retries",
+            "retry_backoff_factor",
+            "retry_status_codes",
+            "total_retries",
+        ):
+            del state[key]
+        restored = requests.Session.__new__(requests.Session)
+        restored.__setstate__(state)
+        assert restored.max_retries == 0
+        assert restored.retry_backoff_factor == 0.5
+        assert restored.retry_status_codes == frozenset({429, 500, 502, 503, 504})
+        assert restored.total_retries == 0
 
 
 SendCall = collections.namedtuple("SendCall", ("args", "kwargs"))

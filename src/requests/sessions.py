@@ -10,10 +10,12 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
 import time
 from collections import OrderedDict
 from collections.abc import Generator, Mapping, MutableMapping
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from typing import TYPE_CHECKING, Any, cast
 
 from ._internal_utils import to_native_string
@@ -29,8 +31,10 @@ from .cookies import (
 )
 from .exceptions import (
     ChunkedEncodingError,
+    ConnectionError,
     ContentDecodingError,
     InvalidSchema,
+    Timeout,
     TooManyRedirects,
 )
 from .hooks import default_hooks, dispatch_hook
@@ -71,6 +75,46 @@ if sys.platform == "win32":
     preferred_clock = time.perf_counter
 else:
     preferred_clock = time.time
+
+
+def _body_resendable(request: PreparedRequest) -> bool:
+    """Determine whether a prepared body can be sent again for a retry.
+
+    Byte-string bodies are inherently reusable. Streaming bodies (files,
+    generators) can only be resent if their starting position was recorded
+    during preparation, so they can be rewound before the next attempt.
+    """
+    body = request.body
+    if body is None or isinstance(body, (str, bytes)):
+        return True
+    return isinstance(request._body_position, int)
+
+
+def _rewind_body_for_retry(request: PreparedRequest) -> None:
+    """Rewind a streaming body to its recorded position before a retry."""
+    if isinstance(request._body_position, int):
+        rewind_body(request, purpose="retry")
+
+
+def _parse_retry_after(value: str | None) -> float | None:
+    """Parse a ``Retry-After`` header value into seconds to wait.
+
+    Supports both delay-seconds and HTTP-date forms. Returns None if the
+    header is missing or cannot be parsed.
+    """
+    if not value:
+        return None
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        pass
+    try:
+        retry_at = parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return None
+    if retry_at.tzinfo is None:
+        retry_at = retry_at.replace(tzinfo=timezone.utc)
+    return max(0.0, (retry_at - datetime.now(timezone.utc)).total_seconds())
 
 
 def merge_setting(
@@ -420,6 +464,10 @@ class Session(SessionRedirectMixin):
     verify: _t.VerifyType
     cert: _t.CertType
     max_redirects: int
+    max_retries: int
+    retry_backoff_factor: float
+    retry_status_codes: frozenset[int]
+    total_retries: int
     trust_env: bool
     cookies: RequestsCookieJar
     adapters: MutableMapping[str, BaseAdapter]
@@ -437,6 +485,10 @@ class Session(SessionRedirectMixin):
         "stream",
         "trust_env",
         "max_redirects",
+        "max_retries",
+        "retry_backoff_factor",
+        "retry_status_codes",
+        "total_retries",
     ]
 
     def __init__(self) -> None:
@@ -486,6 +538,30 @@ class Session(SessionRedirectMixin):
         #: This defaults to requests.models.DEFAULT_REDIRECT_LIMIT, which is
         #: 30.
         self.max_redirects = DEFAULT_REDIRECT_LIMIT
+
+        #: Maximum number of times a single request is retried after a
+        #: transient failure: a connection or timeout error, or a response
+        #: whose status code is listed in ``retry_status_codes``. Retries
+        #: are disabled by default (0), in which case exactly one attempt
+        #: is made per request, as before.
+        self.max_retries = 0
+
+        #: Base delay, in seconds, for the exponential backoff between
+        #: retries. The delay before retry ``n`` is
+        #: ``retry_backoff_factor * (2 ** (n - 1))``, unless the server
+        #: sent a ``Retry-After`` header, which takes precedence.
+        self.retry_backoff_factor = 0.5
+
+        #: Response status codes considered transient and eligible for
+        #: retrying when ``max_retries`` is non-zero.
+        self.retry_status_codes = frozenset({429, 500, 502, 503, 504})
+
+        #: Total number of retries performed by this session. Only updated
+        #: when a retry actually happens, guarded by a lock so the session
+        #: can be shared across threads; requests that never retry never
+        #: acquire the lock.
+        self.total_retries = 0
+        self._retry_lock = threading.Lock()
 
         #: Trust environment settings for proxy configuration, default
         #: authentication and similar.
@@ -780,8 +856,42 @@ class Session(SessionRedirectMixin):
         # Start time (approximately) of the request
         start = preferred_clock()
 
-        # Send the request
-        r = adapter.send(request, **kwargs)
+        # Send the request, retrying transient failures when retries are
+        # enabled on the session. With the default ``max_retries`` of 0 this
+        # performs exactly one attempt, preserving the historical behavior.
+        # The ``timeout`` kwarg applies to each attempt individually; backoff
+        # waits between attempts come on top of it.
+        attempt = 0
+        while True:
+            if attempt:
+                # A previous attempt may have consumed a streaming body;
+                # rewind it to the position recorded during preparation.
+                _rewind_body_for_retry(request)
+            try:
+                # Send the request
+                r = adapter.send(request, **kwargs)
+            except (ConnectionError, Timeout):
+                if attempt >= self.max_retries or not _body_resendable(request):
+                    raise
+                attempt += 1
+                self._delay_retry(attempt, None)
+                continue
+            if (
+                attempt < self.max_retries
+                and r.status_code in self.retry_status_codes
+                and _body_resendable(request)
+            ):
+                # The decision is made from the response headers alone, so
+                # no body bytes have been handed to the caller yet and it is
+                # still safe to retry, even when stream=True. Once a response
+                # is accepted, failures while downloading its body are not
+                # retried, as earlier bytes may already have been delivered.
+                attempt += 1
+                retry_after = r.headers.get("Retry-After")
+                r.close()
+                self._delay_retry(attempt, retry_after)
+                continue
+            break
 
         # Total elapsed time of the request (approximately)
         elapsed = preferred_clock() - start
@@ -827,6 +937,22 @@ class Session(SessionRedirectMixin):
             r.content
 
         return r
+
+    def _delay_retry(self, attempt: int, retry_after: str | None) -> None:
+        """Wait before the next retry attempt and record the retry.
+
+        Honors the server-provided ``Retry-After`` value when present,
+        otherwise falls back to exponential backoff based on
+        ``retry_backoff_factor``.
+        """
+        delay = _parse_retry_after(retry_after)
+        if delay is None:
+            delay = self.retry_backoff_factor * (2 ** (attempt - 1))
+        # The lock is only acquired when a retry actually happens, so
+        # requests that never retry never pay for it.
+        with self._retry_lock:
+            self.total_retries += 1
+        time.sleep(delay)
 
     def merge_environment_settings(
         self,
@@ -903,6 +1029,18 @@ class Session(SessionRedirectMixin):
     def __setstate__(self, state: dict[str, Any]) -> None:
         for attr, value in state.items():
             setattr(self, attr, value)
+
+        # The lock is not picklable; recreate it. Retry settings may be
+        # absent from states pickled before they existed.
+        self._retry_lock = threading.Lock()
+        if not hasattr(self, "max_retries"):
+            self.max_retries = 0
+        if not hasattr(self, "retry_backoff_factor"):
+            self.retry_backoff_factor = 0.5
+        if not hasattr(self, "retry_status_codes"):
+            self.retry_status_codes = frozenset({429, 500, 502, 503, 504})
+        if not hasattr(self, "total_retries"):
+            self.total_retries = 0
 
 
 def session() -> Session:
