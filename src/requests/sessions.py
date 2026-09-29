@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
 import time
 from collections import OrderedDict
 from collections.abc import Generator, Mapping, MutableMapping
@@ -29,8 +30,10 @@ from .cookies import (
 )
 from .exceptions import (
     ChunkedEncodingError,
+    ConnectionError,
     ContentDecodingError,
     InvalidSchema,
+    Timeout,
     TooManyRedirects,
 )
 from .hooks import default_hooks, dispatch_hook
@@ -71,6 +74,15 @@ if sys.platform == "win32":
     preferred_clock = time.perf_counter
 else:
     preferred_clock = time.time
+
+#: Response status codes that are treated as transient failures and are
+#: eligible for a retry when ``Session.max_retries`` is enabled.
+DEFAULT_RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
+
+#: Base delay, in seconds, for the exponential backoff between retry
+#: attempts. The delay before retry ``n`` is
+#: ``retry_backoff_factor * (2 ** (n - 1))``.
+DEFAULT_RETRY_BACKOFF_FACTOR = 0.5
 
 
 def merge_setting(
@@ -420,6 +432,9 @@ class Session(SessionRedirectMixin):
     verify: _t.VerifyType
     cert: _t.CertType
     max_redirects: int
+    max_retries: int
+    retry_backoff_factor: float
+    retry_statuses: frozenset[int]
     trust_env: bool
     cookies: RequestsCookieJar
     adapters: MutableMapping[str, BaseAdapter]
@@ -437,6 +452,9 @@ class Session(SessionRedirectMixin):
         "stream",
         "trust_env",
         "max_redirects",
+        "max_retries",
+        "retry_backoff_factor",
+        "retry_statuses",
     ]
 
     def __init__(self) -> None:
@@ -487,6 +505,23 @@ class Session(SessionRedirectMixin):
         #: 30.
         self.max_redirects = DEFAULT_REDIRECT_LIMIT
 
+        #: Maximum number of times a single request is retried after a
+        #: transient failure: a connection error, a timeout, or a response
+        #: whose status code is in ``retry_statuses``. Each redirect hop
+        #: gets its own retry budget. This defaults to 0, which disables
+        #: retrying entirely.
+        self.max_retries = 0
+
+        #: Base delay, in seconds, between retry attempts. The delay grows
+        #: exponentially: ``retry_backoff_factor * (2 ** (n - 1))`` before
+        #: retry ``n``. A ``Retry-After`` response header takes precedence
+        #: over this curve.
+        self.retry_backoff_factor = DEFAULT_RETRY_BACKOFF_FACTOR
+
+        #: Response status codes that are treated as transient failures and
+        #: retried when ``max_retries`` is enabled.
+        self.retry_statuses = DEFAULT_RETRY_STATUSES
+
         #: Trust environment settings for proxy configuration, default
         #: authentication and similar.
         self.trust_env = True
@@ -502,11 +537,23 @@ class Session(SessionRedirectMixin):
         self.mount("https://", HTTPAdapter())
         self.mount("http://", HTTPAdapter())
 
+        # Guards ``_total_retries``. It is only ever acquired when a retry
+        # actually happens, so requests that are not retried never pay for
+        # it. Reading the configuration attributes above needs no lock.
+        self._retry_lock = threading.Lock()
+        self._total_retries = 0
+
     def __enter__(self) -> Self:
         return self
 
     def __exit__(self, *args: Any) -> None:
         self.close()
+
+    @property
+    def total_retries(self) -> int:
+        """The number of retry attempts performed by this session so far."""
+        with self._retry_lock:
+            return self._total_retries
 
     def prepare_request(self, request: Request) -> PreparedRequest:
         """Constructs a :class:`PreparedRequest <PreparedRequest>` for
@@ -781,7 +828,7 @@ class Session(SessionRedirectMixin):
         start = preferred_clock()
 
         # Send the request
-        r = adapter.send(request, **kwargs)
+        r = self._send_with_retries(request, adapter, **kwargs)
 
         # Total elapsed time of the request (approximately)
         elapsed = preferred_clock() - start
@@ -827,6 +874,95 @@ class Session(SessionRedirectMixin):
             r.content
 
         return r
+
+    def _send_with_retries(
+        self, request: PreparedRequest, adapter: BaseAdapter, **kwargs: Any
+    ) -> Response:
+        """Send a request through the adapter, retrying transient failures.
+
+        A retry is only possible while the response is still entirely in
+        our hands: either the adapter raised before producing a response,
+        or the response carries a retryable status code and none of its
+        body has been handed to the caller yet. Failures that surface
+        while a streamed response is being consumed are never retried.
+        """
+        max_retries = self.max_retries
+        if not max_retries or max_retries < 0:
+            return adapter.send(request, **kwargs)
+
+        stream = kwargs.get("stream")
+        retries = 0
+        while True:
+            try:
+                r = adapter.send(request, **kwargs)
+            except (ConnectionError, Timeout):
+                if retries >= max_retries or not self._replay_body(request):
+                    raise
+                self._sleep_before_retry(retries + 1)
+                retries += 1
+                self._record_retry()
+                continue
+
+            if r.status_code not in self.retry_statuses or retries >= max_retries:
+                return r
+
+            if not self._replay_body(request):
+                # The body cannot be replayed; hand back the response we
+                # got rather than sending an empty body on the next try.
+                return r
+
+            if not stream:
+                r.content  # Consume socket so it can be released
+            r.close()
+
+            self._sleep_before_retry(retries + 1, response=r)
+            retries += 1
+            self._record_retry()
+
+    @staticmethod
+    def _replay_body(request: PreparedRequest) -> bool:
+        """Prepare the request body for another attempt.
+
+        Returns ``False`` when the body is a stream whose position was
+        never recorded (e.g. a generator): it cannot be replayed, so the
+        retry must be abandoned. Bodies with a recorded position are
+        rewound via :func:`rewind_body`, which may raise
+        :class:`UnrewindableBodyError`.
+        """
+        body = request.body
+        if body is None or isinstance(body, (str, bytes)):
+            # Strings, byte strings and encoded forms can be re-sent as-is.
+            return True
+        if request._body_position is not None:
+            rewind_body(request, purpose="retry")
+            return True
+        return False
+
+    def _sleep_before_retry(self, retry: int, response: Response | None = None) -> None:
+        """Sleep before the next retry attempt.
+
+        ``retry`` is the 1-based number of the upcoming retry. A
+        ``Retry-After`` header, when present, takes precedence over the
+        exponential backoff curve.
+        """
+        delay: float | None = None
+        if response is not None:
+            retry_after = response.headers.get("Retry-After")
+            if retry_after is not None:
+                try:
+                    delay = max(0, int(retry_after))
+                except ValueError:
+                    # e.g. the HTTP-date form; fall back to the backoff
+                    # curve.
+                    delay = None
+        if delay is None:
+            delay = self.retry_backoff_factor * (2 ** (retry - 1))
+        if delay > 0:
+            time.sleep(delay)
+
+    def _record_retry(self) -> None:
+        with self._retry_lock:
+            self._total_retries += 1
 
     def merge_environment_settings(
         self,
@@ -903,6 +1039,17 @@ class Session(SessionRedirectMixin):
     def __setstate__(self, state: dict[str, Any]) -> None:
         for attr, value in state.items():
             setattr(self, attr, value)
+        # Locks cannot be pickled; recreate the one guarding the counter.
+        self._retry_lock = threading.Lock()
+        if not hasattr(self, "_total_retries"):
+            self._total_retries = 0
+        # States pickled before retries existed lack these attributes.
+        if not hasattr(self, "max_retries"):
+            self.max_retries = 0
+        if not hasattr(self, "retry_backoff_factor"):
+            self.retry_backoff_factor = DEFAULT_RETRY_BACKOFF_FACTOR
+        if not hasattr(self, "retry_statuses"):
+            self.retry_statuses = DEFAULT_RETRY_STATUSES
 
 
 def session() -> Session:

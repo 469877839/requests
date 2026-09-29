@@ -1,6 +1,7 @@
 """Tests for Requests."""
 
 import collections
+import concurrent.futures
 import contextlib
 import io
 import json
@@ -17,7 +18,7 @@ import urllib3
 from urllib3.util import Timeout as Urllib3Timeout
 
 import requests
-from requests.adapters import HTTPAdapter
+from requests.adapters import BaseAdapter, HTTPAdapter
 from requests.auth import HTTPDigestAuth, _basic_auth_str
 from requests.compat import (
     JSONDecodeError,
@@ -2326,6 +2327,323 @@ class TestRequests:
         assert r.history[1].status_code == 200
         assert not r.history[1].is_redirect
         assert r.url == urls_test[2]
+
+
+class ScriptedAdapter(BaseAdapter):
+    """A test double that plays back a scripted sequence of outcomes.
+
+    Each outcome is either an exception to raise, or a callable taking the
+    prepared request and returning a Response.
+    """
+
+    def __init__(self, *outcomes):
+        self.outcomes = list(outcomes)
+        self.calls = []
+        self.bodies = []
+        self._lock = threading.Lock()
+
+    def send(self, request, **kwargs):
+        body = request.body
+        if hasattr(body, "read"):
+            # Consume the body the way a real send would.
+            body = body.read()
+        with self._lock:
+            self.calls.append(request)
+            self.bodies.append(body)
+            outcome = self.outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome(request)
+
+    def close(self):
+        pass
+
+
+def scripted_response(
+    status_code=200, url="http://example.com/", headers=None, body=b"ok"
+):
+    def build(request):
+        r = requests.Response()
+        r.status_code = status_code
+        r.url = url
+        r.headers = CaseInsensitiveDict(headers or {})
+        r.raw = io.BytesIO(body)
+        r.request = request
+        return r
+
+    return build
+
+
+def retry_session(adapter, **attrs):
+    s = requests.Session()
+    s.trust_env = False
+    s.mount("http://", adapter)
+    s.mount("https://", adapter)
+    for name, value in attrs.items():
+        setattr(s, name, value)
+    return s
+
+
+class TestSessionRetries:
+    def test_retries_disabled_by_default(self):
+        adapter = ScriptedAdapter(ConnectionError("boom"), scripted_response())
+        s = retry_session(adapter)
+        assert s.max_retries == 0
+        with pytest.raises(ConnectionError):
+            s.get("http://example.com/")
+        assert len(adapter.calls) == 1
+        assert s.total_retries == 0
+
+    def test_retry_on_connection_error(self):
+        adapter = ScriptedAdapter(ConnectionError("boom"), scripted_response())
+        s = retry_session(adapter, max_retries=3)
+        r = s.get("http://example.com/")
+        assert r.status_code == 200
+        assert len(adapter.calls) == 2
+        assert s.total_retries == 1
+
+    def test_retry_on_timeout(self):
+        adapter = ScriptedAdapter(ReadTimeout("boom"), scripted_response())
+        s = retry_session(adapter, max_retries=1)
+        assert s.get("http://example.com/").status_code == 200
+        assert len(adapter.calls) == 2
+
+    def test_retry_budget_exhausted(self):
+        adapter = ScriptedAdapter(ConnectionError("one"), ConnectionError("two"))
+        s = retry_session(adapter, max_retries=1)
+        with pytest.raises(ConnectionError):
+            s.get("http://example.com/")
+        assert len(adapter.calls) == 2
+        assert s.total_retries == 1
+
+    def test_retry_on_retryable_status(self):
+        adapter = ScriptedAdapter(scripted_response(503), scripted_response())
+        s = retry_session(adapter, max_retries=2)
+        r = s.get("http://example.com/")
+        assert r.status_code == 200
+        assert len(adapter.calls) == 2
+        assert s.total_retries == 1
+
+    def test_non_retryable_status_returned_immediately(self):
+        adapter = ScriptedAdapter(scripted_response(404))
+        s = retry_session(adapter, max_retries=2)
+        assert s.get("http://example.com/").status_code == 404
+        assert len(adapter.calls) == 1
+        assert s.total_retries == 0
+
+    def test_retry_statuses_configurable(self):
+        adapter = ScriptedAdapter(scripted_response(418), scripted_response())
+        s = retry_session(adapter, max_retries=1, retry_statuses={418})
+        assert s.get("http://example.com/").status_code == 200
+        assert len(adapter.calls) == 2
+
+    def test_retry_after_header_takes_precedence(self, monkeypatch):
+        sleeps = []
+        monkeypatch.setattr("requests.sessions.time.sleep", sleeps.append)
+        adapter = ScriptedAdapter(
+            scripted_response(503, headers={"Retry-After": "7"}),
+            scripted_response(),
+        )
+        s = retry_session(adapter, max_retries=1)
+        s.get("http://example.com/")
+        assert sleeps == [7]
+
+    def test_exponential_backoff(self, monkeypatch):
+        sleeps = []
+        monkeypatch.setattr("requests.sessions.time.sleep", sleeps.append)
+        adapter = ScriptedAdapter(
+            scripted_response(503),
+            scripted_response(503),
+            scripted_response(503),
+            scripted_response(),
+        )
+        s = retry_session(adapter, max_retries=3)
+        s.get("http://example.com/")
+        assert sleeps == [0.5, 1.0, 2.0]
+
+    def test_backoff_factor_configurable(self, monkeypatch):
+        sleeps = []
+        monkeypatch.setattr("requests.sessions.time.sleep", sleeps.append)
+        adapter = ScriptedAdapter(scripted_response(503), scripted_response())
+        s = retry_session(adapter, max_retries=1, retry_backoff_factor=2)
+        s.get("http://example.com/")
+        assert sleeps == [2]
+
+    def test_retry_reuses_form_body(self):
+        adapter = ScriptedAdapter(ConnectionError("boom"), scripted_response())
+        s = retry_session(adapter, max_retries=1)
+        r = s.post("http://example.com/", data={"a": "b"})
+        assert r.status_code == 200
+        assert adapter.bodies == ["a=b", "a=b"]
+
+    def test_retry_rewinds_file_body(self):
+        adapter = ScriptedAdapter(ConnectionError("boom"), scripted_response())
+        s = retry_session(adapter, max_retries=1)
+        r = s.post("http://example.com/", data=io.BytesIO(b"payload"))
+        assert r.status_code == 200
+        assert adapter.bodies == [b"payload", b"payload"]
+
+    def test_retry_abandoned_for_generator_body(self, monkeypatch):
+        sleeps = []
+        monkeypatch.setattr("requests.sessions.time.sleep", sleeps.append)
+        adapter = ScriptedAdapter(ConnectionError("boom"), scripted_response())
+        s = retry_session(adapter, max_retries=3)
+        with pytest.raises(ConnectionError):
+            s.post("http://example.com/", data=(b"x" for _ in range(2)))
+        assert len(adapter.calls) == 1
+        assert sleeps == []
+        assert s.total_retries == 0
+
+    def test_retryable_status_returned_when_body_not_replayable(self):
+        adapter = ScriptedAdapter(scripted_response(503), scripted_response())
+        s = retry_session(adapter, max_retries=3)
+        r = s.post("http://example.com/", data=(b"x" for _ in range(2)))
+        assert r.status_code == 503
+        assert len(adapter.calls) == 1
+
+    def test_unrewindable_body_raises_with_retry_message(self):
+        class UnseekableBody:
+            def tell(self):
+                return 0
+
+            def seek(self, pos):
+                raise OSError("cannot seek")
+
+            def read(self, size=-1):
+                return b""
+
+            def __iter__(self):
+                return iter(())
+
+        adapter = ScriptedAdapter(ConnectionError("boom"), scripted_response())
+        s = retry_session(adapter, max_retries=3)
+        with pytest.raises(UnrewindableBodyError, match="for retry"):
+            s.post("http://example.com/", data=UnseekableBody())
+
+    def test_rewind_body_retry_message(self):
+        class BadFileObj:
+            def tell(self):
+                return 0
+
+            def __iter__(self):
+                return
+
+        prep = requests.Request(
+            "GET", "http://example.com", data=BadFileObj()
+        ).prepare()
+        with pytest.raises(UnrewindableBodyError) as e:
+            requests.utils.rewind_body(prep, purpose="retry")
+        assert "Unable to rewind request body for retry." in str(e.value)
+
+    def test_rewind_body_redirect_message_unchanged(self):
+        class BadFileObj:
+            def tell(self):
+                return 0
+
+            def __iter__(self):
+                return
+
+        prep = requests.Request(
+            "GET", "http://example.com", data=BadFileObj()
+        ).prepare()
+        with pytest.raises(UnrewindableBodyError) as e:
+            requests.utils.rewind_body(prep)
+        assert "Unable to rewind request body for redirect." in str(e.value)
+
+    def test_retries_not_recorded_in_redirect_history(self):
+        adapter = ScriptedAdapter(
+            scripted_response(503),
+            scripted_response(302, headers={"location": "http://example.com/target"}),
+            scripted_response(url="http://example.com/target"),
+        )
+        s = retry_session(adapter, max_retries=2)
+        r = s.get("http://example.com/")
+        assert r.status_code == 200
+        assert len(adapter.calls) == 3
+        assert [h.status_code for h in r.history] == [302]
+
+    def test_retry_on_redirect_hop_preserves_history(self):
+        adapter = ScriptedAdapter(
+            scripted_response(302, headers={"location": "http://example.com/target"}),
+            scripted_response(503, url="http://example.com/target"),
+            scripted_response(url="http://example.com/target"),
+        )
+        s = retry_session(adapter, max_retries=2)
+        r = s.get("http://example.com/")
+        assert r.status_code == 200
+        assert len(adapter.calls) == 3
+        assert [h.status_code for h in r.history] == [302]
+        assert s.total_retries == 1
+
+    def test_retry_rewinds_body_after_redirect_hop(self):
+        adapter = ScriptedAdapter(
+            scripted_response(307, headers={"location": "http://example.com/target"}),
+            ConnectionError("boom"),
+            scripted_response(url="http://example.com/target"),
+        )
+        s = retry_session(adapter, max_retries=1)
+        r = s.post("http://example.com/", data=io.BytesIO(b"payload"))
+        assert r.status_code == 200
+        # Rewound once for the redirect, once for the retry.
+        assert adapter.bodies == [b"payload", b"payload", b"payload"]
+
+    def test_response_hooks_fire_once_per_final_response(self):
+        adapter = ScriptedAdapter(
+            ConnectionError("boom"), scripted_response(503), scripted_response()
+        )
+        s = retry_session(adapter, max_retries=3)
+        seen = []
+        s.hooks["response"].append(lambda r, **kwargs: seen.append(r.status_code))
+        r = s.get("http://example.com/")
+        assert r.status_code == 200
+        assert seen == [200]
+
+    def test_retry_with_streaming_response(self):
+        adapter = ScriptedAdapter(
+            scripted_response(503), scripted_response(body=b"streamed")
+        )
+        s = retry_session(adapter, max_retries=1)
+        r = s.get("http://example.com/", stream=True)
+        assert r.status_code == 200
+        assert r.content == b"streamed"
+        assert len(adapter.calls) == 2
+
+    def test_total_retries_is_thread_safe(self):
+        failures = 8
+
+        class FlakyAdapter(BaseAdapter):
+            def __init__(self):
+                self.failures_left = failures
+                self._lock = threading.Lock()
+
+            def send(self, request, **kwargs):
+                with self._lock:
+                    if self.failures_left:
+                        self.failures_left -= 1
+                        raise ConnectionError("boom")
+                return scripted_response()(request)
+
+            def close(self):
+                pass
+
+        s = retry_session(FlakyAdapter(), max_retries=failures)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+            futures = [
+                pool.submit(s.get, "http://example.com/") for _ in range(failures)
+            ]
+            for future in futures:
+                assert future.result().status_code == 200
+        assert s.total_retries == failures
+
+    def test_session_with_retry_config_is_pickleable(self):
+        s = requests.Session()
+        s.max_retries = 3
+        s.retry_backoff_factor = 2
+        s2 = pickle.loads(pickle.dumps(s))
+        assert s2.max_retries == 3
+        assert s2.retry_backoff_factor == 2
+        assert s2.retry_statuses == s.retry_statuses
+        assert s2.total_retries == 0
 
 
 class TestCaseInsensitiveDict:

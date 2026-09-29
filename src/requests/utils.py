@@ -1136,9 +1136,12 @@ def urldefragauth(url: str) -> str:
     return urlunparse((scheme, netloc, path, params, query, ""))
 
 
-def rewind_body(prepared_request: PreparedRequest) -> None:
+def rewind_body(prepared_request: PreparedRequest, purpose: str = "redirect") -> None:
     """Move file pointer back to its recorded starting position
-    so it can be read again on redirect.
+    so it can be read again on redirect or retry.
+
+    :param purpose: what the body is being rewound for (``"redirect"`` or
+        ``"retry"``); only used to phrase the error message.
     """
     body_seek = getattr(prepared_request.body, "seek", None)
     if body_seek is not None and isinstance(
@@ -1149,7 +1152,7 @@ def rewind_body(prepared_request: PreparedRequest) -> None:
             body_seek(prepared_request._body_position)
         except OSError:
             raise UnrewindableBodyError(
-                "An error occurred when rewinding request body for redirect."
+                f"An error occurred when rewinding request body for {purpose}."
             )
     else:
-        raise UnrewindableBodyError("Unable to rewind request body for redirect.")
+        raise UnrewindableBodyError(f"Unable to rewind request body for {purpose}.")
