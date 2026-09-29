@@ -5,6 +5,14 @@ dev
 ---
 
 - \[Short description of non-trivial change.\]
+- One-shot streaming request bodies (e.g. generators) are now replayed in
+  full when a 307/308 redirect requires the body to be re-sent, matching the
+  behavior of seekable file objects. Bytes are tee'd into a
+  `SpooledTemporaryFile` as they are sent (spilling to disk past a 1 MiB
+  in-memory threshold, `requests.models.BODY_REPLAY_MEMORY_THRESHOLD`), each
+  rebuilt request gets its own read position over the shared spool, and the
+  temporary file is closed deterministically when the redirect chain
+  finishes, when a send fails, or when the session is closed.
 
 
 2.34.2 (2026-05-14)

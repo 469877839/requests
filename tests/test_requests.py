@@ -56,7 +56,7 @@ from requests.structures import CaseInsensitiveDict
 
 from . import SNIMissingWarning
 from .compat import StringIO
-from .testserver.server import TLSServer, consume_socket_content
+from .testserver.server import Server, TLSServer, consume_socket_content
 from .utils import override_environ
 
 # Requests to this URL should always fail with a connection timeout (nothing
@@ -79,6 +79,96 @@ try:
     HAS_PYOPENSSL = True
 except AttributeError:
     HAS_PYOPENSSL = False
+
+
+class _ReceivedRequest:
+    def __init__(self, request_line, headers, body):
+        self.request_line = request_line
+        self.headers = headers
+        self.body = body
+
+
+class _SocketReader:
+    def __init__(self, sock):
+        self.sock = sock
+        self.buffer = b""
+
+    def read_exactly(self, size):
+        while len(self.buffer) < size:
+            data = self.sock.recv(65536)
+            if not data:
+                raise ConnectionError("unexpected EOF reading request")
+            self.buffer += data
+        result, self.buffer = self.buffer[:size], self.buffer[size:]
+        return result
+
+    def read_line(self):
+        while b"\r\n" not in self.buffer:
+            data = self.sock.recv(65536)
+            if not data:
+                raise ConnectionError("unexpected EOF reading request")
+            self.buffer += data
+        line, _, self.buffer = self.buffer.partition(b"\r\n")
+        return line
+
+
+def _read_raw_request(sock):
+    """Read one HTTP request from a socket, dechunking the body if needed."""
+    reader = _SocketReader(sock)
+    request_line = reader.read_line()
+    headers = {}
+    while True:
+        line = reader.read_line()
+        if not line:
+            break
+        name, _, value = line.partition(b":")
+        headers[name.strip().lower().decode("latin-1")] = value.strip().decode(
+            "latin-1"
+        )
+    if headers.get("transfer-encoding") == "chunked":
+        body = b""
+        while True:
+            size = int(reader.read_line().split(b";")[0], 16)
+            if size == 0:
+                # Consume any trailers up to the terminating empty line.
+                while reader.read_line():
+                    pass
+                break
+            body += reader.read_exactly(size)
+            reader.read_exactly(2)  # trailing CRLF after each chunk
+    elif "content-length" in headers:
+        body = reader.read_exactly(int(headers["content-length"]))
+    else:
+        body = b""
+    return _ReceivedRequest(request_line, headers, body)
+
+
+@contextlib.contextmanager
+def _redirect_server(status_code, requests_to_handle, always_redirect=False):
+    """A raw-socket server that answers the first request with a redirect to
+    /target and any later request with 200, capturing every request it gets."""
+    received = []
+    reason = {307: "Temporary Redirect", 308: "Permanent Redirect"}[status_code]
+
+    def handler(sock):
+        sock.settimeout(5)
+        received.append(_read_raw_request(sock))
+        if len(received) == 1 or always_redirect:
+            response = (
+                f"HTTP/1.1 {status_code} {reason}\r\n"
+                "Location: /target\r\n"
+                "Content-Length: 0\r\n"
+                "\r\n"
+            )
+        else:
+            response = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+        sock.sendall(response.encode("latin-1"))
+
+    with Server(handler=handler, requests_to_handle=requests_to_handle) as (
+        host,
+        port,
+    ):
+        yield received, f"http://{host}:{port}"
 
 
 class TestRequests:
@@ -2098,6 +2188,133 @@ class TestRequests:
             requests.utils.rewind_body(prep)
 
         assert "Unable to rewind request body" in str(e)
+
+    def test_prepare_body_wraps_one_shot_stream(self):
+        prep = requests.Request(
+            "POST", "http://example.com", data=iter([b"a", b"b"])
+        ).prepare()
+        # Still sent chunked, with no Content-Length added.
+        assert prep.headers["Transfer-Encoding"] == "chunked"
+        assert "Content-Length" not in prep.headers
+        assert prep._body_position is None
+        assert prep.body.read() == b"ab"
+
+    def test_replayable_body_copies_have_independent_positions(self):
+        prep = requests.Request(
+            "POST", "http://example.com", data=iter([b"abc", b"def"])
+        ).prepare()
+        forked = prep.copy()
+        assert prep.body.read(2) == b"ab"
+        # The copy starts from the beginning and is unaffected by the
+        # original's read position, and vice versa.
+        assert forked.body.read() == b"abcdef"
+        assert prep.body.read() == b"cdef"
+
+    def test_replayable_body_resumes_source_after_partial_send(self):
+        prep = requests.Request(
+            "POST", "http://example.com", data=iter([b"abc", b"def"])
+        ).prepare()
+        # Simulate a first send that fails midway through the body.
+        assert prep.body.read(4) == b"abcd"
+        # A rebuilt request replays the spooled prefix and then resumes the
+        # underlying stream where the failed send left off.
+        assert prep.copy().body.read() == b"abcdef"
+
+    def test_replayable_body_spills_to_temp_file(self, monkeypatch):
+        monkeypatch.setattr(requests.models, "BODY_REPLAY_MEMORY_THRESHOLD", 4)
+        prep = requests.Request(
+            "POST", "http://example.com", data=iter([b"x" * 100])
+        ).prepare()
+        assert prep.body.read() == b"x" * 100
+        assert prep.body._spool._spool._rolled
+        prep.body.close()
+
+    def test_replayable_body_spool_closed_on_send_error(self):
+        prep = requests.Request(
+            "POST", "http://127.0.0.1:1/", data=iter([b"test"])
+        ).prepare()
+        spool = prep.body._spool
+        session = requests.Session()
+        with pytest.raises(ConnectionError):
+            session.send(prep)
+        assert spool._closed
+
+    @pytest.mark.parametrize("status_code", (307, 308))
+    def test_redirect_resends_generator_body_in_full(self, status_code):
+        body_parts = [b"hello ", b"world"]
+        with _redirect_server(status_code, requests_to_handle=2) as (
+            received,
+            url,
+        ):
+            r = requests.post(f"{url}/start", data=iter(body_parts))
+        assert r.status_code == 200
+        assert r.history[0].status_code == status_code
+        first, second = received
+        # The body is re-sent in full on the redirected request, still
+        # chunked and without a Content-Length.
+        assert first.headers.get("transfer-encoding") == "chunked"
+        assert second.headers.get("transfer-encoding") == "chunked"
+        assert "content-length" not in second.headers
+        assert first.body == b"hello world"
+        assert second.body == b"hello world"
+
+    def test_redirect_resends_seekable_body_unchanged(self):
+        with _redirect_server(307, requests_to_handle=2) as (received, url):
+            r = requests.post(f"{url}/start", data=io.BytesIO(b"hello world"))
+        assert r.status_code == 200
+        first, second = received
+        for request in (first, second):
+            assert request.headers.get("content-length") == "11"
+            assert "transfer-encoding" not in request.headers
+            assert request.body == b"hello world"
+
+    def test_redirect_generator_body_spool_closed_after_chain(self):
+        with _redirect_server(307, requests_to_handle=2) as (received, url):
+            r = requests.post(f"{url}/start", data=iter([b"test"]))
+        assert r.status_code == 200
+        assert r.history[0].request.body._spool._closed
+
+    def test_redirect_generator_body_spool_closed_on_too_many_redirects(self):
+        session = requests.Session()
+        session.max_redirects = 2
+        prep = requests.Request(
+            "POST", "http://placeholder.invalid/", data=iter([b"test"])
+        ).prepare()
+        spool = prep.body._spool
+        with _redirect_server(307, requests_to_handle=3, always_redirect=True) as (
+            received,
+            url,
+        ):
+            prep.url = f"{url}/start"
+            with pytest.raises(TooManyRedirects):
+                session.send(prep)
+        assert spool._closed
+
+    def test_redirect_next_request_replays_generator_body(self):
+        session = requests.Session()
+        with _redirect_server(307, requests_to_handle=2) as (received, url):
+            r = session.post(f"{url}/start", data=iter([b"test"]), allow_redirects=False)
+            assert r.status_code == 307
+            spool = r.request.body._spool
+            # Kept open for the follow-up request stored on Response.next().
+            assert not spool._closed
+            assert r.next is not None
+
+            r2 = session.send(r.next)
+            assert r2.status_code == 200
+            assert spool._closed
+        first, second = received
+        assert second.body == b"test"
+
+    def test_replayable_body_spool_closed_on_session_close(self):
+        session = requests.Session()
+        with _redirect_server(307, requests_to_handle=1) as (received, url):
+            r = session.post(f"{url}/start", data=iter([b"test"]), allow_redirects=False)
+            assert r.status_code == 307
+            spool = r.request.body._spool
+            assert not spool._closed
+            session.close()
+            assert spool._closed
 
     def test_getattr_proxy_stream_follows_redirect(self, httpbin):
         """Ensure stream wrappers that don't implement __iter__ directly are still detected."""

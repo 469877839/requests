@@ -13,6 +13,8 @@ import datetime
 # Implicit import within threads may cause LookupError when standard library is in a ZIP,
 # such as in Embedded Python. See https://github.com/psf/requests/issues/3578.
 import encodings.idna  # noqa: F401
+import tempfile
+import threading
 from collections.abc import Callable, Generator, Iterable, Iterator, Mapping
 from io import UnsupportedOperation
 from typing import (
@@ -103,6 +105,116 @@ REDIRECT_STATI: Final[tuple[int, ...]] = (  # type: ignore[assignment]
 DEFAULT_REDIRECT_LIMIT: int = 30
 CONTENT_CHUNK_SIZE: int = 10 * 1024
 ITER_CHUNK_SIZE: int = 512
+
+#: Maximum number of bytes of a replayable streaming request body that are
+#: buffered in memory before spilling over to a temporary file.
+BODY_REPLAY_MEMORY_THRESHOLD: int = 1024 * 1024
+
+#: Read size used when teeing a streaming request body into its replay cache.
+_BODY_REPLAY_CHUNK_SIZE: Final[int] = 64 * 1024
+
+
+class _BodySpool:
+    """Shared, lazily-filled cache of a one-shot streaming request body.
+
+    Bytes are tee'd into a :class:`tempfile.SpooledTemporaryFile` as they are
+    pulled from the source, so the body can be replayed from the beginning
+    (e.g. when a 307/308 redirect requires it to be re-sent) without holding
+    more than ``BODY_REPLAY_MEMORY_THRESHOLD`` bytes in memory. If a first
+    send fails midway, the spool holds exactly the bytes read so far, so a
+    later replay re-serves the spooled prefix and resumes the source where
+    it left off.
+    """
+
+    def __init__(self, source: Any) -> None:
+        self._source_read = getattr(source, "read", None)
+        self._source_iter = None if self._source_read is not None else iter(source)
+        self._spool = tempfile.SpooledTemporaryFile(
+            max_size=BODY_REPLAY_MEMORY_THRESHOLD
+        )
+        self._spooled = 0
+        self._exhausted = False
+        self._closed = False
+        self._lock = threading.Lock()
+
+    def _fill_until(self, target: float) -> None:
+        # Pull chunks from the source into the spool. Caller must hold the lock.
+        while self._spooled < target and not self._exhausted:
+            if self._source_read is not None:
+                chunk = self._source_read(_BODY_REPLAY_CHUNK_SIZE)
+                if not chunk:
+                    self._exhausted = True
+                    break
+            else:
+                try:
+                    chunk = next(self._source_iter)  # type: ignore[arg-type]
+                except StopIteration:
+                    self._exhausted = True
+                    break
+            if isinstance(chunk, str):
+                chunk = chunk.encode("utf-8")
+            # Reads may have moved the shared file position; always append.
+            self._spool.seek(self._spooled)
+            self._spool.write(chunk)
+            self._spooled += len(chunk)
+
+    def read(self, offset: int, size: int = -1) -> bytes:
+        """Return up to ``size`` bytes starting at ``offset``.
+
+        Pulls more data from the source into the spool as needed. Returns
+        ``b""`` once the spool has been closed.
+        """
+        with self._lock:
+            if self._closed:
+                return b""
+            if size is None or size < 0:
+                self._fill_until(float("inf"))
+                end = self._spooled
+            else:
+                self._fill_until(offset + size)
+                end = min(offset + size, self._spooled)
+            if offset >= end:
+                return b""
+            self._spool.seek(offset)
+            return self._spool.read(end - offset)
+
+    def close(self) -> None:
+        with self._lock:
+            if not self._closed:
+                self._closed = True
+                self._spool.close()
+
+
+class _ReplayableBody:
+    """A per-request view over a shared :class:`_BodySpool`.
+
+    Each view keeps its own read offset, so a request rebuilt for a redirect
+    reads the body from the start regardless of how far the previous request
+    consumed its own view.
+    """
+
+    def __init__(self, spool: _BodySpool) -> None:
+        self._spool = spool
+        self._offset = 0
+
+    def read(self, size: int = -1) -> bytes:
+        data = self._spool.read(self._offset, size)
+        self._offset += len(data)
+        return data
+
+    def __iter__(self) -> Iterator[bytes]:
+        while True:
+            chunk = self.read(_BODY_REPLAY_CHUNK_SIZE)
+            if not chunk:
+                return
+            yield chunk
+
+    def fork(self) -> _ReplayableBody:
+        """Return a new view over the same spool, positioned at the start."""
+        return _ReplayableBody(self._spool)
+
+    def close(self) -> None:
+        self._spool.close()
 
 
 class RequestEncodingMixin:
@@ -459,7 +571,12 @@ class PreparedRequest(RequestEncodingMixin, RequestHooksMixin):
         p.url = self.url
         p.headers = self.headers.copy() if self.headers is not None else None  # type: ignore[assignment]
         p._cookies = _copy_cookie_jar(self._cookies)
-        p.body = self.body
+        if isinstance(self.body, _ReplayableBody):
+            # Give the copy its own view over the shared spool so consuming
+            # one request's body does not affect the other's read position.
+            p.body = self.body.fork()  # type: ignore[assignment]
+        else:
+            p.body = self.body
         p.hooks = self.hooks
         p._body_position = self._body_position
         return p
@@ -628,6 +745,13 @@ class PreparedRequest(RequestEncodingMixin, RequestHooksMixin):
                 self.headers["Content-Length"] = builtin_str(length)
             else:
                 self.headers["Transfer-Encoding"] = "chunked"
+
+            if self._body_position is None:
+                # The body is a one-shot stream (e.g. a generator) whose
+                # position cannot be recorded for rewinding. Tee it into a
+                # spooled cache so it can be replayed in full if a 307/308
+                # redirect requires the body to be re-sent.
+                body = _ReplayableBody(_BodySpool(body))
         else:
             # After is_stream filtering, remaining data is raw (not streamed)
             raw_data = cast("_t.RawDataType | None", data)

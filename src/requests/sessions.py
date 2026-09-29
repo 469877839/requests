@@ -43,6 +43,7 @@ from .models import (  # noqa: F401
     Request,
     Response,
 )
+from .models import _ReplayableBody
 from .status_codes import codes
 from .structures import CaseInsensitiveDict
 from .utils import (  # noqa: F401
@@ -502,6 +503,11 @@ class Session(SessionRedirectMixin):
         self.mount("https://", HTTPAdapter())
         self.mount("http://", HTTPAdapter())
 
+        # Spooled replay caches of streaming request bodies that are still
+        # needed (e.g. by an unsent ``Response.next()`` redirect request).
+        # They are closed here when the session's connection pools are.
+        self._open_body_spools: set[Any] = set()
+
     def __enter__(self) -> Self:
         return self
 
@@ -777,56 +783,77 @@ class Session(SessionRedirectMixin):
         # Get the appropriate adapter to use
         adapter = self.get_adapter(url=request.url)
 
+        # A replayable streaming body (e.g. a generator) shares its spooled
+        # cache with every request rebuilt for a 307/308 redirect. Track it
+        # so its temporary file is released deterministically.
+        body_spool = (
+            request.body._spool
+            if isinstance(request.body, _ReplayableBody)
+            else None
+        )
+        if body_spool is not None:
+            self._open_body_spools.add(body_spool)
+
         # Start time (approximately) of the request
         start = preferred_clock()
 
-        # Send the request
-        r = adapter.send(request, **kwargs)
+        # Whether the spooled body cache must outlive this call: a follow-up
+        # redirect request stored on Response.next() may still need it.
+        keep_body_spool = False
 
-        # Total elapsed time of the request (approximately)
-        elapsed = preferred_clock() - start
-        r.elapsed = timedelta(seconds=elapsed)
+        try:
+            # Send the request
+            r = adapter.send(request, **kwargs)
 
-        # Response manipulation hooks
-        r = dispatch_hook("response", hooks, r, **kwargs)
+            # Total elapsed time of the request (approximately)
+            elapsed = preferred_clock() - start
+            r.elapsed = timedelta(seconds=elapsed)
 
-        # Persist cookies
-        if r.history:
-            # If the hooks create history then we want those cookies too
-            for resp in r.history:
-                extract_cookies_to_jar(self.cookies, resp.request, resp.raw)
+            # Response manipulation hooks
+            r = dispatch_hook("response", hooks, r, **kwargs)
 
-        extract_cookies_to_jar(self.cookies, request, r.raw)
+            # Persist cookies
+            if r.history:
+                # If the hooks create history then we want those cookies too
+                for resp in r.history:
+                    extract_cookies_to_jar(self.cookies, resp.request, resp.raw)
 
-        # Resolve redirects if allowed.
-        if allow_redirects:
-            # Redirect resolving generator.
-            gen = self.resolve_redirects(r, request, **kwargs)
-            history = [resp for resp in gen]
-        else:
-            history = []
+            extract_cookies_to_jar(self.cookies, request, r.raw)
 
-        # Shuffle things around if there's history.
-        if history:
-            # Insert the first (original) request at the start
-            history.insert(0, r)
-            # Get the last request made
-            r = history.pop()
-            r.history = history
+            # Resolve redirects if allowed.
+            if allow_redirects:
+                # Redirect resolving generator.
+                gen = self.resolve_redirects(r, request, **kwargs)
+                history = [resp for resp in gen]
+            else:
+                history = []
 
-        # If redirects aren't being followed, store the response on the Request for Response.next().
-        if not allow_redirects:
-            try:
-                r._next = next(  # type: ignore[assignment]  # yield_requests=True returns PreparedRequest
-                    self.resolve_redirects(r, request, yield_requests=True, **kwargs)
-                )
-            except StopIteration:
-                pass
+            # Shuffle things around if there's history.
+            if history:
+                # Insert the first (original) request at the start
+                history.insert(0, r)
+                # Get the last request made
+                r = history.pop()
+                r.history = history
 
-        if not stream:
-            r.content
+            # If redirects aren't being followed, store the response on the Request for Response.next().
+            if not allow_redirects:
+                try:
+                    r._next = next(  # type: ignore[assignment]  # yield_requests=True returns PreparedRequest
+                        self.resolve_redirects(r, request, yield_requests=True, **kwargs)
+                    )
+                    keep_body_spool = True
+                except StopIteration:
+                    pass
 
-        return r
+            if not stream:
+                r.content
+
+            return r
+        finally:
+            if body_spool is not None and not keep_body_spool:
+                body_spool.close()
+                self._open_body_spools.discard(body_spool)
 
     def merge_environment_settings(
         self,
@@ -882,6 +909,11 @@ class Session(SessionRedirectMixin):
 
     def close(self) -> None:
         """Closes all adapters and as such the session"""
+        # Release any spooled replay caches of streaming request bodies that
+        # are still open (e.g. for an unsent Response.next() request).
+        for body_spool in tuple(self._open_body_spools):
+            body_spool.close()
+        self._open_body_spools.clear()
         for v in self.adapters.values():
             v.close()
 
